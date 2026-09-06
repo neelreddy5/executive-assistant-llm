@@ -9,14 +9,17 @@ export function GoogleConnectStep({ onComplete }: Props) {
   const [state, setState] = useState<"idle" | "connecting" | "connected">("idle");
 
   useEffect(() => {
-    if (state !== "connecting") return;
-    const connected = window.setTimeout(() => setState("connected"), 1050);
-    const next = window.setTimeout(onComplete, 2050);
-    return () => {
-      window.clearTimeout(connected);
-      window.clearTimeout(next);
-    };
-  }, [state, onComplete]);
+  if (state === "idle") return;
+
+  const timer = window.setTimeout(
+    state === "connecting"
+      ? () => setState("connected")
+      : onComplete,
+    state === "connecting" ? 1050 : 1000,
+  );
+
+  return () => window.clearTimeout(timer);
+}, [state, onComplete]);
 
   return (
     <main className="center-stage onboarding-stage">
