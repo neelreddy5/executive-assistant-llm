@@ -23,11 +23,10 @@ export function GoogleConnectStep({ onComplete }: Props) {
 
   return (
     <main className="center-stage onboarding-stage">
-      <div className="brand-mark"><span>AM</span></div>
-      <p className="eyebrow">Your working day, thoughtfully managed</p>
+      <h2 className="eyebrow">Your working day, thoughtfully managed</h2>
       <h1>Meet your executive<br />assistant.</h1>
       <p className="lede">
-        A voice-first partner for Alex Morgan that understands your time,
+        A voice-first partner that understands your time,
         handles coordination, and keeps you in control.
       </p>
 
