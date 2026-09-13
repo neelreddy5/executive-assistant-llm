@@ -26,6 +26,13 @@ type Params = {
   onSavePreferences: (preferences: Preferences) => void;
 };
 
+function voiceErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  // SDK errors can include connection URLs with short-lived credentials.
+  const detail = message.replace(/(?:https?|wss?):\/\/\S+/gi, "[connection URL]").slice(0, 500);
+  return detail ? `Could not connect to the voice service: ${detail}` : "Could not connect to the voice service. Please try again.";
+}
+
 export function useExecutiveAssistant({ assistant, context, onSavePreferences }: Params) {
   const [error, setError] = useState<string>();
   const [draft, setDraft] = useState<EmailDraft>();
@@ -49,10 +56,13 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       setConnecting(false);
       setError(undefined);
     },
-    onDisconnect: () => setConnecting(false),
-    onError: () => {
+    onDisconnect: (details) => {
       setConnecting(false);
-      setError("The voice session was interrupted. Please try connecting again.");
+      if (details.reason === "error") setError(voiceErrorMessage(details.message));
+    },
+    onError: (message) => {
+      setConnecting(false);
+      setError(voiceErrorMessage(message));
     },
     onMessage: (message) => {
       const event = message as unknown as { message?: string; source?: string };
@@ -94,7 +104,9 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     setError(undefined);
     setConnecting(true);
     try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // The SDK opens its own stream; release this permission-check stream.
+      stream.getTracks().forEach((track) => track.stop());
     } catch {
       setConnecting(false);
       setError("Microphone access is needed for a voice conversation. Allow access in your browser and try again.");
@@ -102,16 +114,19 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     }
 
     try {
-      const credential = await fetch(`/api/elevenlabs/session?agentId=${encodeURIComponent(assistant.agentId)}`);
+      const credential = await fetch(`/api/elevenlabs/session?agentId=${encodeURIComponent(assistant.agentId)}`, { cache: "no-store" });
+      const data = await credential.json() as { signedUrl?: string; code?: string; error?: string };
       if (credential.ok) {
-        const { signedUrl } = (await credential.json()) as { signedUrl: string };
-        await conversation.startSession({ signedUrl });
-      } else {
+        if (!data.signedUrl) throw new Error("The server did not return a voice-session credential.");
+        await conversation.startSession({ signedUrl: data.signedUrl, connectionType: "websocket" });
+      } else if (credential.status === 503 && data.code === "PUBLIC_AGENT_ONLY") {
         await conversation.startSession({ agentId: assistant.agentId, connectionType: "webrtc" });
+      } else {
+        throw new Error(data.error || `Voice-session authorization failed (${credential.status}).`);
       }
-    } catch {
+    } catch (error) {
       setConnecting(false);
-      setError("I couldn’t connect to the voice service. Check the agent configuration and try again.");
+      setError(voiceErrorMessage(error));
     }
   }, [assistant.agentId, assistant.name, conversation]);
 
