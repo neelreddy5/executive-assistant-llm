@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarDays, ChevronDown, Mic, RotateCcw, Square } from "lucide-react";
+import { CalendarDays, ChevronDown, Mic, RotateCcw, PhoneOff } from "lucide-react";
 import { ActionStatus } from "./ActionStatus";
 import { AgentStatus } from "./AgentStatus";
 import { EmailDraftCard } from "./EmailDraftCard";
@@ -40,7 +40,7 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
             <button className="primary-button voice-start" onClick={session.start}><Mic size={17} /> Start voice setup</button>
           )}
           {session.connected && (
-            <button className="quiet-button" onClick={session.stop}><Square size={12} /> End conversation</button>
+            <button type="button" className="end-conversation-button" onClick={session.stop}><PhoneOff size={16} aria-hidden="true" /> End conversation</button>
           )}
           {session.error && <p className="session-error" role="alert">{session.error}</p>}
           <p className="privacy-note">Preferences stay in this browser. Calendar access remains with your ElevenLabs agent.</p>
@@ -59,7 +59,7 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
               {!session.connected && session.status !== "connecting" ? (
                 <button className="primary-button voice-start" onClick={session.start}><Mic size={17} /> Speak with {assistant.name}</button>
               ) : session.connected ? (
-                <button className="quiet-button" onClick={session.stop}><Square size={12} /> End conversation</button>
+                <button type="button" className="end-conversation-button" onClick={session.stop}><PhoneOff size={16} aria-hidden="true" /> End conversation</button>
               ) : null}
               {session.error && <p className="session-error" role="alert">{session.error}</p>}
             </div>

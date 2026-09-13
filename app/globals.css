@@ -101,6 +101,9 @@ h1 { margin: 0; font-size: clamp(48px, 6vw, 78px); line-height: .98; letter-spac
 .status-divider, .status-copy { color: var(--faint); }
 .voice-start { margin-top: 24px; }
 .quiet-button { margin-top: 20px; }
+.end-conversation-button { margin-top: 20px; min-height: 44px; padding: 0 20px; display: inline-flex; align-items: center; justify-content: center; gap: 9px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; transition: background .2s ease, border-color .2s ease; }
+.end-conversation-button:hover { background: #302521; border-color: var(--danger); }
+.end-conversation-button:active { background: #3a2c27; }
 .session-error { max-width: 430px; color: #dca39a; font-size: 12px; line-height: 1.5; }
 
 .dashboard-grid { min-height: calc(100vh - 71px); display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 440px); }

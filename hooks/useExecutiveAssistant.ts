@@ -26,6 +26,16 @@ type Params = {
   onSavePreferences: (preferences: Preferences) => void;
 };
 
+// Filter delivery cues in captions only. Keep bracketed content such as
+// [Board Review] and [insert date] intact; never rewrite the spoken audio.
+export function cleanAssistantCaption(text: string): string {
+  return text
+    .replace(/\[(?:reassuring|warm|warmly|calm|calmly|confident|confidently|cheerful|excited|enthusiastic|empathetic|thoughtful|serious|professional|friendly|curious|sad|angry|sarcastic|sighs?|laughs?|laughing|chuckles?|whispers?|whispering|shouts?|shouting|pause|short pause|long pause)\]/gi, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/ +([,.!?;:])/g, "$1")
+    .trim();
+}
+
 function voiceErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
   // SDK errors can include connection URLs with short-lived credentials.
@@ -66,7 +76,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     },
     onMessage: (message) => {
       const event = message as unknown as { message?: string; source?: string };
-      if (event.source === "ai" && event.message) setLastMessage(event.message);
+      if (event.source === "ai" && event.message) setLastMessage(cleanAssistantCaption(event.message));
     },
     clientTools: {
       save_preferences: async (input: PreferenceInput) => {

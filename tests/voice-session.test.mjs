@@ -14,6 +14,16 @@ function loadModule(path, dependencies, globals = {}) {
   return exports;
 }
 
+test("captions hide delivery cues while preserving meaningful bracketed content", () => {
+  const { cleanAssistantCaption } = loadModule("../hooks/useExecutiveAssistant.ts", {
+    react: {}, "@elevenlabs/react": {},
+  });
+  assert.equal(cleanAssistantCaption("[reassuring] Done. [short pause] Lunch is blocked."), "Done. Lunch is blocked.");
+  assert.equal(cleanAssistantCaption("[REASSURING] Your [Board Review] is on [insert date]."), "Your [Board Review] is on [insert date].");
+  assert.equal(cleanAssistantCaption("Done [sighs]."), "Done.");
+  assert.equal(cleanAssistantCaption("[reassuring]"), "");
+});
+
 test("agent IDs tolerate literal dashboard quotes and surrounding whitespace", () => {
   const { normalizeAgentId, assistants } = loadModule("../lib/assistants.ts", {}, {
     process: { env: { NEXT_PUBLIC_COVE_AGENT_ID: "'agent_test'" } },
