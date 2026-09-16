@@ -52,7 +52,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const [lastMessage, setLastMessage] = useState("I’m ready when you are.");
   const [connecting, setConnecting] = useState(false);
   const [agenda, setAgenda] = useState<CalendarEvents>();
-  const [assistantMuted, setAssistantMuted] = useState(false);
+  const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [reconnectNeedsReload, setReconnectNeedsReload] = useState(false);
   // SDK status can become "error" after a nonfatal client-tool error while
   // the underlying audio session is still connected.
@@ -81,7 +81,9 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   }, []);
 
   const conversation = useConversation({
-    volume: assistantMuted ? 0 : 1,
+    // Controlled input mute is applied by the SDK when a session is created,
+    // including when the user mutes before connecting.
+    micMuted: microphoneMuted,
     onConnect: () => {
       if (cancelled.current) {
         conversation.endSession();
@@ -233,15 +235,15 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     endSession();
   }, [endSession]);
 
-  const toggleAssistantMuted = useCallback(() => {
-    const next = !assistantMuted;
-    // Silence current playback synchronously; the controlled option reapplies on reconnect.
+  const toggleMicrophoneMuted = useCallback(() => {
+    const next = !microphoneMuted;
+    // Stop microphone chunks immediately; the controlled option reapplies on reconnect.
     if (connected) {
-      try { conversation.setVolume({ volume: next ? 0 : 1 }); }
+      try { conversation.setMuted(next); }
       catch { /* A disconnect may release the SDK session before React updates. */ }
     }
-    setAssistantMuted(next);
-  }, [assistantMuted, connected, conversation]);
+    setMicrophoneMuted(next);
+  }, [connected, conversation, microphoneMuted]);
 
   const status = useMemo(() => {
     if (error) return "error" as const;
@@ -261,8 +263,8 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     actions,
     lastMessage,
     agenda,
-    assistantMuted,
-    toggleAssistantMuted,
+    microphoneMuted,
+    toggleMicrophoneMuted,
     reconnectNeedsReload,
   };
 }

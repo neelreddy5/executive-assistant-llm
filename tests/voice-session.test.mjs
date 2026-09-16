@@ -45,6 +45,7 @@ function hookHarness(response, options = {}) {
   const states = [];
   const values = [];
   const volumes = [];
+  const microphoneMutes = [];
   const refs = [];
   const timers = new Map();
   let refCursor = 0;
@@ -53,7 +54,13 @@ function hookHarness(response, options = {}) {
   let cursor = 0;
   let callbacks;
   let stopped = false;
-  const conversation = { status: "disconnected", startSession: (options) => { sessions.push(options); }, endSession: () => { ends++; }, setVolume: ({ volume }) => volumes.push(volume) };
+  const conversation = {
+    status: "disconnected",
+    startSession: (options) => { sessions.push(options); },
+    endSession: () => { ends++; },
+    setMuted: (muted) => microphoneMutes.push(muted),
+    setVolume: ({ volume }) => volumes.push(volume),
+  };
   const { useExecutiveAssistant } = loadModule("../hooks/useExecutiveAssistant.ts", {
     react: {
       useCallback: (callback) => callback,
@@ -92,7 +99,7 @@ function hookHarness(response, options = {}) {
     return useExecutiveAssistant({ assistant: { agentId: "agent_test", name: "Cove" }, context: {} });
   }
   const hook = render();
-  return { hook, render, conversation, volumes, sessions, states, timers, expire: () => { for (const callback of [...timers.values()]) callback(); }, get ends() { return ends; }, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
+  return { hook, render, conversation, microphoneMutes, volumes, sessions, states, timers, expire: () => { for (const callback of [...timers.values()]) callback(); }, get ends() { return ends; }, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
 }
 
 test("calendar tool updates the agenda, preserves it on invalid results, and accepts empty weeks", async () => {
@@ -109,23 +116,27 @@ test("calendar tool updates the agenda, preserves it on invalid results, and acc
   assert.equal(harness.render().agenda.events.length, 0);
 });
 
-test("assistant mute changes playback immediately and remains controlled across reconnects", () => {
+test("microphone mute blocks input without muting assistant playback and persists across reconnects", () => {
   const harness = hookHarness();
   harness.conversation.status = "connected";
-  harness.render().toggleAssistantMuted();
-  assert.deepEqual(harness.volumes, [0]);
-  assert.equal(harness.render().assistantMuted, true);
-  assert.equal(harness.callbacks.volume, 0);
-  assert.equal(harness.callbacks.micMuted, undefined);
-  harness.conversation.status = "disconnected";
-  assert.equal(harness.render().assistantMuted, true);
-  harness.conversation.status = "connected";
-  assert.equal(harness.render().assistantMuted, true);
   harness.callbacks.onConnect();
-  assert.deepEqual(harness.volumes, [0]);
-  harness.render().toggleAssistantMuted();
-  assert.deepEqual(harness.volumes, [0, 1]);
-  assert.equal(harness.render().assistantMuted, false);
+  harness.render().toggleMicrophoneMuted();
+  assert.deepEqual(harness.microphoneMutes, [true]);
+  assert.deepEqual(harness.volumes, []);
+  assert.equal(harness.render().microphoneMuted, true);
+  assert.equal(harness.callbacks.micMuted, true);
+  assert.equal(harness.callbacks.volume, undefined);
+  harness.conversation.status = "disconnected";
+  harness.callbacks.onDisconnect({ reason: "user" });
+  assert.equal(harness.render().microphoneMuted, true);
+  harness.conversation.status = "connected";
+  harness.callbacks.onConnect();
+  assert.equal(harness.render().microphoneMuted, true);
+  assert.equal(harness.callbacks.micMuted, true);
+  harness.render().toggleMicrophoneMuted();
+  assert.deepEqual(harness.microphoneMutes, [true, false]);
+  assert.deepEqual(harness.volumes, []);
+  assert.equal(harness.render().microphoneMuted, false);
 });
 
 test("calendar dates respect timezone, midnight endings, exclusive ranges, and recurrence IDs", () => {
@@ -239,15 +250,16 @@ test("calendar tool errors do not turn a healthy voice session into a connection
   assert.equal(harness.render().status, "listening");
 });
 
-test("connect callback does not depend on volume controls being ready", async () => {
+test("connect callback does not depend on input controls being ready", async () => {
   const harness = hookHarness({ ok: true, json: async () => ({ signedUrl: "wss://example.test/session" }) });
   await harness.hook.start();
-  harness.conversation.setVolume = () => { throw new Error("No active conversation"); };
+  harness.conversation.setMuted = () => { throw new Error("No active conversation"); };
   harness.callbacks.onConnect();
   harness.conversation.status = "connected";
   assert.equal(harness.render().status, "listening");
   assert.equal(harness.timers.size, 0);
-  assert.doesNotThrow(() => harness.render().toggleAssistantMuted());
+  assert.doesNotThrow(() => harness.render().toggleMicrophoneMuted());
+  assert.equal(harness.render().microphoneMuted, true);
 });
 
 test("mute is visible before connecting and joining has a cancel control", () => {
@@ -256,10 +268,11 @@ test("mute is visible before connecting and joining has a cancel control", () =>
   });
   const props = { muted: false, onToggleMute: () => {}, onStop: () => {}, connected: false, connecting: false };
   const idle = renderToStaticMarkup(createElement(ConversationControls, props));
-  assert.match(idle, /Mute assistant/);
+  assert.match(idle, /Mute microphone/);
   assert.doesNotMatch(idle, /End conversation/);
   const joining = renderToStaticMarkup(createElement(ConversationControls, { ...props, connecting: true, muted: true }));
-  assert.match(joining, /Unmute assistant/);
+  assert.match(joining, /Unmute microphone/);
+  assert.match(joining, /Microphone will be muted/);
   assert.match(joining, /Cancel connection/);
   assert.match(joining, /aria-pressed="true"/);
 });
