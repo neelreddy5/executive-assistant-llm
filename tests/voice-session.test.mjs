@@ -39,15 +39,26 @@ test("agent IDs tolerate literal dashboard quotes and surrounding whitespace", (
 function hookHarness(response) {
   const sessions = [];
   const states = [];
+  const values = [];
+  const volumes = [];
+  let cursor = 0;
   let callbacks;
   let stopped = false;
-  const conversation = { status: "disconnected", startSession: async (options) => sessions.push(options) };
+  const conversation = { status: "disconnected", startSession: async (options) => sessions.push(options), setVolume: ({ volume }) => volumes.push(volume) };
   const { useExecutiveAssistant } = loadModule("../hooks/useExecutiveAssistant.ts", {
     react: {
       useCallback: (callback) => callback,
       useMemo: (callback) => callback(),
-      useState: () => [undefined, (value) => states.push(value)],
+      useState: (initial) => {
+        const index = cursor++;
+        if (!(index in values)) values[index] = initial;
+        return [values[index], (value) => {
+          values[index] = typeof value === "function" ? value(values[index]) : value;
+          states.push(values[index]);
+        }];
+      },
     },
+    "@/lib/calendar-events": loadModule("../lib/calendar-events.ts", {}),
     "@elevenlabs/react": { useConversation: (options) => { callbacks = options; return conversation; } },
   }, {
     fetch: async () => response,
@@ -55,11 +66,69 @@ function hookHarness(response) {
       getTracks: () => [{ stop: () => { stopped = true; } }],
     }) } },
   });
-  // React primitives are mocked above to exercise session orchestration directly.
-  // eslint-disable-next-line react-hooks/rules-of-hooks
-  const hook = useExecutiveAssistant({ assistant: { agentId: "agent_test", name: "Cove" }, context: {} });
-  return { hook, sessions, states, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
+  function render() {
+    cursor = 0;
+    // React primitives are mocked above to exercise session orchestration directly.
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    return useExecutiveAssistant({ assistant: { agentId: "agent_test", name: "Cove" }, context: {} });
+  }
+  const hook = render();
+  return { hook, render, conversation, volumes, sessions, states, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
 }
+
+test("calendar tool updates the agenda, preserves it on invalid results, and accepts empty weeks", async () => {
+  const harness = hookHarness();
+  const input = { rangeStart: "2026-09-14", rangeEnd: "2026-09-21", timezone: "America/New_York", events: [
+    { id: "meeting", title: "Review", start: "2026-09-14T09:00:00-04:00", end: "2026-09-14T10:00:00-04:00", allDay: false },
+  ] };
+  await harness.callbacks.clientTools.show_calendar_events(input);
+  const previous = harness.render().agenda;
+  assert.equal(previous.events[0].title, "Review");
+  await assert.rejects(harness.callbacks.clientTools.show_calendar_events({ ...input, timezone: "Invalid/Zone" }));
+  assert.equal(harness.render().agenda, previous);
+  await harness.callbacks.clientTools.show_calendar_events({ ...input, events: [] });
+  assert.equal(harness.render().agenda.events.length, 0);
+});
+
+test("assistant mute changes playback immediately and remains controlled across reconnects", () => {
+  const harness = hookHarness();
+  harness.conversation.status = "connected";
+  harness.render().toggleAssistantMuted();
+  assert.deepEqual(harness.volumes, [0]);
+  assert.equal(harness.render().assistantMuted, true);
+  assert.equal(harness.callbacks.volume, 0);
+  assert.equal(harness.callbacks.micMuted, undefined);
+  harness.conversation.status = "disconnected";
+  assert.equal(harness.render().assistantMuted, true);
+  harness.conversation.status = "connected";
+  assert.equal(harness.render().assistantMuted, true);
+  harness.callbacks.onConnect();
+  assert.deepEqual(harness.volumes, [0, 0]);
+  harness.render().toggleAssistantMuted();
+  assert.deepEqual(harness.volumes, [0, 0, 1]);
+  assert.equal(harness.render().assistantMuted, false);
+});
+
+test("calendar dates respect timezone, midnight endings, exclusive ranges, and recurrence IDs", () => {
+  const { parseCalendarEvents, groupCalendarEvents, calendarEventTime } = loadModule("../lib/calendar-events.ts", {});
+  const event = { id: "series_1", title: "Review", start: "2026-09-15T02:00:00Z", end: "2026-09-15T04:00:00Z", allDay: false };
+  const result = parseCalendarEvents({ rangeStart: "2026-09-14", rangeEnd: "2026-09-21", timezone: "America/New_York", events: [
+    event, event,
+    { ...event, id: "series_2", start: "2026-09-16T09:00:00-04:00", end: "2026-09-16T10:00:00-04:00" },
+    { id: "trip", title: "Trip", start: "2026-09-19", end: "2026-09-22", allDay: true },
+  ] });
+  assert.equal(result.events.length, 3);
+  assert.equal(JSON.stringify(groupCalendarEvents(result).map(({ date }) => date)), JSON.stringify(["2026-09-14", "2026-09-16", "2026-09-19", "2026-09-20"]));
+  assert.match(calendarEventTime(event, result.timezone), /10:00 PM/);
+  const dst = { ...event, start: "2026-11-01T01:30:00-04:00", end: "2026-11-01T01:30:00-05:00" };
+  assert.match(calendarEventTime(dst, result.timezone), /EDT.*EST/);
+  for (const changes of [
+    { rangeStart: "2026-02-30" }, { rangeEnd: "2026-09-14" },
+    { events: [{ ...event, start: "2026-09-14T09:00:00" }] },
+    { events: [{ ...event, end: event.start }] },
+    { events: [{ ...event, allDay: true }] },
+  ]) assert.throws(() => parseCalendarEvents({ ...result, ...changes }));
+});
 
 test("credential rejection is shown without attempting an unauthenticated session", async () => {
   const harness = hookHarness({ ok: false, status: 502, json: async () => ({ error: "Credentials rejected" }) });

@@ -42,6 +42,21 @@ export type EmailDraft = {
 };
 
 export type ActionState = "pending" | "active" | "complete" | "failed";
+export type CalendarEvent = {
+  id: string;
+  title: string;
+  start: string;
+  end: string;
+  allDay: boolean;
+};
+
+export type CalendarEvents = {
+  rangeStart: string;
+  rangeEnd: string;
+  timezone: string;
+  events: CalendarEvent[];
+};
+
 export type AssistantAction = {
   id: string;
   label: string;

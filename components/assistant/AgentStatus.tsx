@@ -3,6 +3,7 @@ import type { AssistantConfig } from "@/lib/types";
 type Props = {
   assistant: AssistantConfig;
   status: "idle" | "connecting" | "listening" | "speaking" | "error";
+  muted?: boolean;
 };
 
 const labels = {
@@ -13,13 +14,13 @@ const labels = {
   error: "Needs your attention",
 };
 
-export function AgentStatus({ assistant, status }: Props) {
+export function AgentStatus({ assistant, status, muted = false }: Props) {
   return (
     <div className="agent-status">
       <span className={`status-dot ${status}`} />
       <span>{assistant.name}</span>
       <span className="status-divider">/</span>
-      <span className="status-copy">{labels[status]}</span>
+      <span className="status-copy">{muted && status !== "error" ? "Assistant audio muted" : labels[status]}</span>
     </div>
   );
 }

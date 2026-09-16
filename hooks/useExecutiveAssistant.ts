@@ -2,10 +2,12 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { useConversation } from "@elevenlabs/react";
+import { parseCalendarEvents } from "@/lib/calendar-events";
 import type {
   ActionState,
   AssistantAction,
   AssistantConfig,
+  CalendarEvents,
   EmailDraft,
   ExecutiveContext,
   Preferences,
@@ -49,6 +51,8 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const [actions, setActions] = useState<AssistantAction[]>([]);
   const [lastMessage, setLastMessage] = useState("I’m ready when you are.");
   const [connecting, setConnecting] = useState(false);
+  const [agenda, setAgenda] = useState<CalendarEvents>();
+  const [assistantMuted, setAssistantMuted] = useState(false);
 
   const upsertAction = useCallback((input: { id?: string; label: string; detail?: string; state: ActionState }) => {
     const id = input.id || input.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
@@ -62,7 +66,11 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   }, []);
 
   const conversation = useConversation({
+    volume: assistantMuted ? 0 : 1,
     onConnect: () => {
+      // The SDK has installed the live session before this callback. Apply mute
+      // here as well, without waiting for its controlled-volume React effect.
+      conversation.setVolume({ volume: assistantMuted ? 0 : 1 });
       setConnecting(false);
       setError(undefined);
     },
@@ -79,6 +87,17 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       if (event.source === "ai" && event.message) setLastMessage(cleanAssistantCaption(event.message));
     },
     clientTools: {
+      show_calendar_events: async (input: unknown) => {
+        try {
+          const result = parseCalendarEvents(input);
+          setAgenda(result);
+          upsertAction({ id: "calendar-display", label: "Calendar agenda updated", state: "complete" });
+          return "The calendar agenda is now displayed. You can summarize the retrieved events.";
+        } catch (error) {
+          upsertAction({ id: "calendar-display", label: "Could not display calendar results", detail: "Previous agenda retained, if available.", state: "failed" });
+          throw new Error(error instanceof Error ? error.message : "Invalid calendar results.");
+        }
+      },
       save_preferences: async (input: PreferenceInput) => {
         onSavePreferences({
           defaultMeetingMinutes: input.defaultMeetingMinutes,
@@ -144,6 +163,13 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     await conversation.endSession();
   }, [conversation]);
 
+  const toggleAssistantMuted = useCallback(() => {
+    const next = !assistantMuted;
+    // Silence current playback synchronously; the controlled option reapplies on reconnect.
+    if (conversation.status === "connected") conversation.setVolume({ volume: next ? 0 : 1 });
+    setAssistantMuted(next);
+  }, [assistantMuted, conversation]);
+
   const status = useMemo(() => {
     if (error) return "error" as const;
     if (connecting) return "connecting" as const;
@@ -161,5 +187,8 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     setDraft,
     actions,
     lastMessage,
+    agenda,
+    assistantMuted,
+    toggleAssistantMuted,
   };
 }

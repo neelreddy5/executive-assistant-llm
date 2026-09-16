@@ -1,6 +1,8 @@
 "use client";
 
-import { CalendarDays, ChevronDown, Mic, RotateCcw, PhoneOff } from "lucide-react";
+import { CalendarDays, ChevronDown, Mic, RotateCcw } from "lucide-react";
+import { CalendarEventsCard } from "./CalendarEventsCard";
+import { ConversationControls } from "./ConversationControls";
 import { ActionStatus } from "./ActionStatus";
 import { AgentStatus } from "./AgentStatus";
 import { EmailDraftCard } from "./EmailDraftCard";
@@ -35,12 +37,12 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
           <h1>Let’s shape how {assistant.name}<br />manages your time.</h1>
           <p className="lede">Your assistant will learn your meeting rhythm, focus time, and boundaries naturally.</p>
           <VoiceOrb state={session.status} accent={assistant.accent} onClick={!session.connected ? session.start : undefined} />
-          <AgentStatus assistant={assistant} status={session.status} />
+          <AgentStatus assistant={assistant} status={session.status} muted={session.assistantMuted} />
           {!session.connected && session.status !== "connecting" && (
             <button className="primary-button voice-start" onClick={session.start}><Mic size={17} /> Start voice setup</button>
           )}
           {session.connected && (
-            <button type="button" className="end-conversation-button" onClick={session.stop}><PhoneOff size={16} aria-hidden="true" /> End conversation</button>
+            <ConversationControls muted={session.assistantMuted} onToggleMute={session.toggleAssistantMuted} onStop={session.stop} />
           )}
           {session.error && <p className="session-error" role="alert">{session.error}</p>}
           <p className="privacy-note">Preferences stay in this browser. Calendar access remains with your ElevenLabs agent.</p>
@@ -54,12 +56,12 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
             </div>
             <div className="voice-center">
               <VoiceOrb state={session.status} accent={assistant.accent} onClick={!session.connected ? session.start : undefined} />
-              <AgentStatus assistant={assistant} status={session.status} />
+              <AgentStatus assistant={assistant} status={session.status} muted={session.assistantMuted} />
               <p className="spoken-caption">“{session.lastMessage}”</p>
               {!session.connected && session.status !== "connecting" ? (
                 <button className="primary-button voice-start" onClick={session.start}><Mic size={17} /> Speak with {assistant.name}</button>
               ) : session.connected ? (
-                <button type="button" className="end-conversation-button" onClick={session.stop}><PhoneOff size={16} aria-hidden="true" /> End conversation</button>
+                <ConversationControls muted={session.assistantMuted} onToggleMute={session.toggleAssistantMuted} onStop={session.stop} />
               ) : null}
               {session.error && <p className="session-error" role="alert">{session.error}</p>}
             </div>
@@ -76,6 +78,7 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
             </div>
           </section>
           <section className="context-rail">
+            {session.agenda && <CalendarEventsCard agenda={session.agenda} />}
             <ActionStatus actions={session.actions} />
             {session.draft && (
               <EmailDraftCard draft={session.draft} onChange={session.setDraft} onClose={() => session.setDraft(undefined)} />
