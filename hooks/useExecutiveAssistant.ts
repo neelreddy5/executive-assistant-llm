@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConversation } from "@elevenlabs/react";
 import { parseCalendarEvents } from "@/lib/calendar-events";
 import type {
@@ -53,6 +53,21 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const [connecting, setConnecting] = useState(false);
   const [agenda, setAgenda] = useState<CalendarEvents>();
   const [assistantMuted, setAssistantMuted] = useState(false);
+  const [reconnectNeedsReload, setReconnectNeedsReload] = useState(false);
+  // SDK status can become "error" after a nonfatal client-tool error while
+  // the underlying audio session is still connected.
+  const [transportConnected, setTransportConnected] = useState(false);
+  const pending = useRef<{ controller: AbortController; timer: ReturnType<typeof setTimeout>; sdkStarted: boolean } | null>(null);
+  const cancelled = useRef(false);
+
+  const clearPending = useCallback(() => {
+    if (pending.current) {
+      clearTimeout(pending.current.timer);
+      pending.current.controller.abort();
+      pending.current = null;
+    }
+    setConnecting(false);
+  }, []);
 
   const upsertAction = useCallback((input: { id?: string; label: string; detail?: string; state: ActionState }) => {
     const id = input.id || input.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
@@ -68,18 +83,31 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const conversation = useConversation({
     volume: assistantMuted ? 0 : 1,
     onConnect: () => {
-      // The SDK has installed the live session before this callback. Apply mute
-      // here as well, without waiting for its controlled-volume React effect.
-      conversation.setVolume({ volume: assistantMuted ? 0 : 1 });
-      setConnecting(false);
+      if (cancelled.current) {
+        conversation.endSession();
+        return;
+      }
+      clearPending();
+      setTransportConnected(true);
       setError(undefined);
     },
-    onDisconnect: (details) => {
-      setConnecting(false);
-      if (details.reason === "error") setError(voiceErrorMessage(details.message));
+    onStatusChange: ({ status }) => {
+      if (status === "disconnected" || status === "disconnecting") setTransportConnected(false);
     },
-    onError: (message) => {
-      setConnecting(false);
+    onDisconnect: (details) => {
+      clearPending();
+      setTransportConnected(false);
+      if (details.reason === "error") setError(voiceErrorMessage(details.message));
+      else if (details.reason === "agent") setError("The assistant ended the conversation. You can reconnect when ready.");
+    },
+    onError: (message, details) => {
+      // Tool failures do not mean the audio connection failed. The SDK still
+      // sends an is_error tool response so the agent can correct its arguments.
+      if (details && typeof details === "object" && "clientToolName" in details) {
+        upsertAction({ id: "tool-error", label: "An assistant action failed", detail: "Please ask the assistant to retry the action.", state: "failed" });
+        return;
+      }
+      clearPending();
       setError(voiceErrorMessage(message));
     },
     onMessage: (message) => {
@@ -125,61 +153,106 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     },
   });
 
+  const connected = transportConnected || conversation.status === "connected";
+
   const start = useCallback(async () => {
+    // This SDK cannot abort a stalled transport handshake. A fresh provider is
+    // needed after cancelling one; do not silently retry its still-held lock.
+    if (reconnectNeedsReload) { window.location.reload(); return; }
+    if (pending.current || connected || conversation.status === "connecting") return;
     if (!assistant.agentId) {
       setError(`Add ${assistant.name}’s agent ID to your environment before starting.`);
       return;
     }
     setError(undefined);
     setConnecting(true);
+    cancelled.current = false;
+    const controller = new AbortController();
+    const attempt = {
+      controller,
+      sdkStarted: false,
+      timer: setTimeout(() => {
+        cancelled.current = true;
+        setReconnectNeedsReload(attempt.sdkStarted);
+        clearPending();
+        setTransportConnected(false);
+        conversation.endSession();
+        setError("Connecting took too long. Check microphone access and your connection, then try again. If it persists, reload this page.");
+      }, 30_000),
+    };
+    pending.current = attempt;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       // The SDK opens its own stream; release this permission-check stream.
       stream.getTracks().forEach((track) => track.stop());
+      if (pending.current !== attempt) return;
     } catch {
-      setConnecting(false);
+      if (pending.current !== attempt) return;
+      clearPending();
       setError("Microphone access is needed for a voice conversation. Allow access in your browser and try again.");
       return;
     }
 
     try {
-      const credential = await fetch(`/api/elevenlabs/session?agentId=${encodeURIComponent(assistant.agentId)}`, { cache: "no-store" });
+      const credential = await fetch(`/api/elevenlabs/session?agentId=${encodeURIComponent(assistant.agentId)}`, { cache: "no-store", signal: controller.signal });
       const data = await credential.json() as { signedUrl?: string; code?: string; error?: string };
+      if (pending.current !== attempt) return;
       if (credential.ok) {
         if (!data.signedUrl) throw new Error("The server did not return a voice-session credential.");
+        attempt.sdkStarted = true;
         await conversation.startSession({ signedUrl: data.signedUrl, connectionType: "websocket" });
       } else if (credential.status === 503 && data.code === "PUBLIC_AGENT_ONLY") {
+        attempt.sdkStarted = true;
         await conversation.startSession({ agentId: assistant.agentId, connectionType: "webrtc" });
       } else {
         throw new Error(data.error || `Voice-session authorization failed (${credential.status}).`);
       }
     } catch (error) {
-      setConnecting(false);
+      if (pending.current !== attempt) return;
+      clearPending();
       setError(voiceErrorMessage(error));
     }
-  }, [assistant.agentId, assistant.name, conversation]);
+  }, [assistant.agentId, assistant.name, clearPending, connected, conversation, reconnectNeedsReload]);
 
   const stop = useCallback(async () => {
+    cancelled.current = true;
+    setReconnectNeedsReload(pending.current?.sdkStarted ?? false);
+    clearPending();
+    setTransportConnected(false);
     await conversation.endSession();
-  }, [conversation]);
+  }, [clearPending, conversation]);
+
+  const endSession = conversation.endSession;
+  useEffect(() => () => {
+    cancelled.current = true;
+    if (pending.current) {
+      clearTimeout(pending.current.timer);
+      pending.current.controller.abort();
+      pending.current = null;
+    }
+    endSession();
+  }, [endSession]);
 
   const toggleAssistantMuted = useCallback(() => {
     const next = !assistantMuted;
     // Silence current playback synchronously; the controlled option reapplies on reconnect.
-    if (conversation.status === "connected") conversation.setVolume({ volume: next ? 0 : 1 });
+    if (connected) {
+      try { conversation.setVolume({ volume: next ? 0 : 1 }); }
+      catch { /* A disconnect may release the SDK session before React updates. */ }
+    }
     setAssistantMuted(next);
-  }, [assistantMuted, conversation]);
+  }, [assistantMuted, connected, conversation]);
 
   const status = useMemo(() => {
     if (error) return "error" as const;
     if (connecting) return "connecting" as const;
-    if (conversation.status !== "connected") return "idle" as const;
+    if (!connected) return "idle" as const;
     return conversation.isSpeaking ? "speaking" as const : "listening" as const;
-  }, [connecting, conversation.isSpeaking, conversation.status, error]);
+  }, [connected, connecting, conversation.isSpeaking, error]);
 
   return {
     status,
-    connected: conversation.status === "connected",
+    connected,
     start,
     stop,
     error,
@@ -190,5 +263,6 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     agenda,
     assistantMuted,
     toggleAssistantMuted,
+    reconnectNeedsReload,
   };
 }

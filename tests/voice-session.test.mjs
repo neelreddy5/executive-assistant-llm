@@ -3,11 +3,15 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
+import { createElement } from "react";
+import * as jsxRuntime from "react/jsx-runtime";
+import { renderToStaticMarkup } from "react-dom/server";
+import * as icons from "lucide-react";
 
 // Exercise application code with network/SDK boundaries mocked; no paid calls.
 function loadModule(path, dependencies, globals = {}) {
   const source = ts.transpileModule(readFileSync(new URL(path, import.meta.url), "utf8"), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX },
   }).outputText;
   const exports = {};
   vm.runInNewContext(source, { exports, require: (name) => dependencies[name], ...globals });
@@ -36,19 +40,30 @@ test("agent IDs tolerate literal dashboard quotes and surrounding whitespace", (
   assert.equal(normalizeAgentId("''"), "");
 });
 
-function hookHarness(response) {
+function hookHarness(response, options = {}) {
   const sessions = [];
   const states = [];
   const values = [];
   const volumes = [];
+  const refs = [];
+  const timers = new Map();
+  let refCursor = 0;
+  let timerId = 0;
+  let ends = 0;
   let cursor = 0;
   let callbacks;
   let stopped = false;
-  const conversation = { status: "disconnected", startSession: async (options) => sessions.push(options), setVolume: ({ volume }) => volumes.push(volume) };
+  const conversation = { status: "disconnected", startSession: (options) => { sessions.push(options); }, endSession: () => { ends++; }, setVolume: ({ volume }) => volumes.push(volume) };
   const { useExecutiveAssistant } = loadModule("../hooks/useExecutiveAssistant.ts", {
     react: {
       useCallback: (callback) => callback,
       useMemo: (callback) => callback(),
+      useEffect: () => {},
+      useRef: (initial) => {
+        const index = refCursor++;
+        refs[index] ??= { current: initial };
+        return refs[index];
+      },
       useState: (initial) => {
         const index = cursor++;
         if (!(index in values)) values[index] = initial;
@@ -61,19 +76,23 @@ function hookHarness(response) {
     "@/lib/calendar-events": loadModule("../lib/calendar-events.ts", {}),
     "@elevenlabs/react": { useConversation: (options) => { callbacks = options; return conversation; } },
   }, {
-    fetch: async () => response,
-    navigator: { mediaDevices: { getUserMedia: async () => ({
+    AbortController,
+    setTimeout: (callback) => { timers.set(++timerId, callback); return timerId; },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: options.fetch ?? (async () => response),
+    navigator: { mediaDevices: { getUserMedia: options.getUserMedia ?? (async () => ({
       getTracks: () => [{ stop: () => { stopped = true; } }],
-    }) } },
+    })) } },
   });
   function render() {
     cursor = 0;
+    refCursor = 0;
     // React primitives are mocked above to exercise session orchestration directly.
     // eslint-disable-next-line react-hooks/rules-of-hooks
     return useExecutiveAssistant({ assistant: { agentId: "agent_test", name: "Cove" }, context: {} });
   }
   const hook = render();
-  return { hook, render, conversation, volumes, sessions, states, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
+  return { hook, render, conversation, volumes, sessions, states, timers, expire: () => { for (const callback of [...timers.values()]) callback(); }, get ends() { return ends; }, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
 }
 
 test("calendar tool updates the agenda, preserves it on invalid results, and accepts empty weeks", async () => {
@@ -103,9 +122,9 @@ test("assistant mute changes playback immediately and remains controlled across 
   harness.conversation.status = "connected";
   assert.equal(harness.render().assistantMuted, true);
   harness.callbacks.onConnect();
-  assert.deepEqual(harness.volumes, [0, 0]);
+  assert.deepEqual(harness.volumes, [0]);
   harness.render().toggleAssistantMuted();
-  assert.deepEqual(harness.volumes, [0, 0, 1]);
+  assert.deepEqual(harness.volumes, [0, 1]);
   assert.equal(harness.render().assistantMuted, false);
 });
 
@@ -159,6 +178,90 @@ test("SDK errors preserve diagnostics but redact signed connection URLs", () => 
   assert.doesNotMatch(harness.states.at(-1), /secret/);
   harness.callbacks.onDisconnect({ reason: "error", message: "Origin rejected" });
   assert.match(harness.states.at(-1), /Origin rejected/);
+});
+
+test("a pending handshake times out and offers recovery rather than joining forever", async () => {
+  const harness = hookHarness({ ok: true, json: async () => ({ signedUrl: "wss://example.test/session" }) });
+  await harness.hook.start();
+  assert.equal(harness.render().status, "connecting");
+  await harness.render().start();
+  assert.equal(harness.sessions.length, 1);
+  harness.expire();
+  assert.match(harness.render().error, /took too long/);
+  assert.equal(harness.render().reconnectNeedsReload, true);
+  assert.equal(harness.ends, 1);
+  assert.equal(harness.timers.size, 0);
+  harness.callbacks.onConnect();
+  assert.equal(harness.ends, 2, "a late connection is ended after cancellation");
+  assert.equal(harness.render().status, "error");
+});
+
+test("cancel during credential fetch prevents late credentials from starting a session", async () => {
+  let resolveFetch;
+  let markFetching;
+  const fetching = new Promise((resolve) => { markFetching = resolve; });
+  const harness = hookHarness(undefined, { fetch: () => new Promise((resolve) => { resolveFetch = resolve; markFetching(); }) });
+  const starting = harness.hook.start();
+  await fetching;
+  await harness.render().stop();
+  resolveFetch({ ok: true, json: async () => ({ signedUrl: "wss://example.test/session" }) });
+  await starting;
+  assert.equal(harness.sessions.length, 0);
+  assert.equal(harness.render().status, "idle");
+  assert.equal(harness.render().reconnectNeedsReload, false);
+});
+
+test("a late microphone permission result releases its stream after timeout", async () => {
+  let resolveMic;
+  let released = false;
+  const harness = hookHarness(undefined, { getUserMedia: () => new Promise((resolve) => { resolveMic = resolve; }) });
+  const starting = harness.hook.start();
+  harness.expire();
+  resolveMic({ getTracks: () => [{ stop: () => { released = true; } }] });
+  await starting;
+  assert.equal(released, true);
+  assert.equal(harness.sessions.length, 0);
+});
+
+test("calendar tool errors do not turn a healthy voice session into a connection error", async () => {
+  const harness = hookHarness();
+  harness.conversation.status = "connected";
+  harness.callbacks.onConnect();
+  // Reproduce ConversationStatusProvider's behavior on a nonfatal tool error.
+  harness.conversation.status = "error";
+  harness.callbacks.onError("Client tool execution failed", { clientToolName: "show_calendar_events" });
+  assert.equal(harness.render().error, undefined);
+  assert.equal(harness.render().status, "listening");
+  assert.equal(harness.render().actions.at(-1).state, "failed");
+  assert.equal(harness.render().connected, true);
+  await harness.render().start();
+  assert.equal(harness.sessions.length, 0, "do not start a second session over the active transport");
+  assert.equal(harness.render().status, "listening");
+});
+
+test("connect callback does not depend on volume controls being ready", async () => {
+  const harness = hookHarness({ ok: true, json: async () => ({ signedUrl: "wss://example.test/session" }) });
+  await harness.hook.start();
+  harness.conversation.setVolume = () => { throw new Error("No active conversation"); };
+  harness.callbacks.onConnect();
+  harness.conversation.status = "connected";
+  assert.equal(harness.render().status, "listening");
+  assert.equal(harness.timers.size, 0);
+  assert.doesNotThrow(() => harness.render().toggleAssistantMuted());
+});
+
+test("mute is visible before connecting and joining has a cancel control", () => {
+  const { ConversationControls } = loadModule("../components/assistant/ConversationControls.tsx", {
+    "react/jsx-runtime": jsxRuntime, "lucide-react": icons,
+  });
+  const props = { muted: false, onToggleMute: () => {}, onStop: () => {}, connected: false, connecting: false };
+  const idle = renderToStaticMarkup(createElement(ConversationControls, props));
+  assert.match(idle, /Mute assistant/);
+  assert.doesNotMatch(idle, /End conversation/);
+  const joining = renderToStaticMarkup(createElement(ConversationControls, { ...props, connecting: true, muted: true }));
+  assert.match(joining, /Unmute assistant/);
+  assert.match(joining, /Cancel connection/);
+  assert.match(joining, /aria-pressed="true"/);
 });
 
 test("server reports upstream authentication failure without exposing secrets", async () => {

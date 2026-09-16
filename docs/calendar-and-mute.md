@@ -8,6 +8,10 @@ The agent must retrieve real calendar results and invoke this display tool befor
 
 The mute button changes assistant output volume between zero and the app's normal volume (one). It does not mute the microphone, pause server processing, or stop calendar/caption updates. The choice survives disconnect/reconnect while the component remains mounted, and resets after a reload/reset. Both onboarding and dashboard share the same controls. No ElevenLabs follow-up configuration is changed.
 
+The mute control is visible before connecting as well as during a session. Connection attempts have a 30-second timeout and a Cancel connection control. Cancelling before SDK startup aborts credential requests and ignores late microphone permission results. If a transport handshake has already started, recovery offers Reload voice session: the installed SDK cannot abort its pending handshake lock immediately. Duplicate starts are ignored, and unmounting the assistant ends the session.
+
+The app tracks successful connection/disconnection events separately from SDK error status. In the installed SDK, a failed client tool sets its general status to `error` without disconnecting audio. Tool errors therefore stay in the activity panel and do not expose a false reconnect button. Output volume uses the SDK's controlled volume option; the connection callback does not call volume controls.
+
 ## Verification
 
 - Run `node --test tests/voice-session.test.mjs`, `npm run lint`, and `npm run build`.
