@@ -59,7 +59,8 @@ test("moving label binds to mutation, ignores agent completion, and finishes on 
   assert.equal(h.actions[0].state, "active");
   h.tracker.response(toolResponse("one"));
   assert.equal(h.actions[0].state, "complete");
-  assert.equal(h.actions[0].label, "Moving Review to 11:30");
+  assert.equal(h.actions[0].label, "Calendar event updated");
+  assert.match(h.actions[0].detail, /Moving Review to 11:30/);
   assert.match(h.actions[0].detail, /Confirmed/);
   h.tracker.response(toolResponse("one", undefined, { full_tool_result: '{"id":"event"}' }));
   h.tracker.upsert({ id: "calendar-update:one", label: "Moving Review", state: "active" });
@@ -84,6 +85,71 @@ test("availability does not claim a moving row; mutation can receive its label a
   late.tracker.response(toolResponse("move"));
   assert.equal(late.actions[0].id, "calendar-update:late");
   assert.equal(late.actions[0].state, "complete");
+});
+
+test("legacy Moving followed by successful create resolves the original row accurately", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ id: "calendar-update:strategy-1", label: "Moving Strategy Catch-Up to 10:30 a.m.", state: "active" });
+  h.tracker.request(toolRequest("create", "google_calendar_create_event"));
+  h.tracker.response(toolResponse("create", "google_calendar_create_event"));
+  assert.equal(h.actions.length, 1);
+  assert.equal(h.actions[0].id, "calendar-update:strategy-1");
+  assert.equal(h.actions[0].state, "complete");
+  assert.equal(h.actions[0].label, "Calendar event created");
+  assert.match(h.actions[0].detail, /Strategy Catch-Up/);
+  assert.match(h.actions[0].detail, /Moving the original event has not been confirmed/);
+  assert.equal(h.timers.size, 0);
+  h.expire();
+  assert.equal(h.actions[0].state, "complete");
+  h.tracker.response(toolResponse("create", "google_calendar_create_event", { full_tool_result: '{"id":"new-event"}' }));
+  assert.equal(h.actions.length, 1);
+});
+
+test("explicit expected tool wins over wording and cannot bind to a different tool", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ id: "calendar-update:one", label: "Moving Review", expectedToolName: "google_calendar_create_event", state: "active" });
+  h.tracker.request(toolRequest("update"));
+  h.tracker.response(toolResponse("update"));
+  assert.equal(h.actions[0].state, "active");
+  h.tracker.request(toolRequest("create", "google_calendar_create_event"));
+  h.tracker.response(toolResponse("create", "google_calendar_create_event"));
+  assert.equal(h.actions[0].state, "complete");
+  assert.equal(h.actions[0].label, "Calendar event created");
+  assert.throws(() => h.tracker.upsert({ label: "Test", state: "active", expectedToolName: "get_preferences" }));
+});
+
+test("cross-kind fallback is safe in either arrival order and refuses concurrent ambiguity", () => {
+  const h = activityHarness();
+  h.tracker.request(toolRequest("create", "google_calendar_create_event"));
+  h.tracker.upsert({ label: "Moving Review", state: "active" });
+  h.tracker.response(toolResponse("create", "google_calendar_create_event"));
+  assert.equal(h.actions.length, 1);
+  assert.equal(h.actions[0].label, "Calendar event created");
+
+  const concurrent = activityHarness();
+  concurrent.tracker.upsert({ label: "Moving Review", state: "active" });
+  concurrent.tracker.upsert({ label: "Creating Workshop", state: "active" });
+  concurrent.tracker.request(toolRequest("create", "google_calendar_create_event"));
+  concurrent.tracker.response(toolResponse("create", "google_calendar_create_event"));
+  assert.equal(concurrent.actions.length, 3);
+  assert.equal(concurrent.actions[0].state, "active");
+  assert.equal(concurrent.actions[1].state, "active");
+  concurrent.expire();
+  assert.ok(concurrent.actions.every((action) => action.state !== "active"));
+});
+
+test("replacement creation plus failed original deletion never claims the event was moved", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ id: "calendar-create:replacement", label: "Creating replacement for Review", expectedToolName: "google_calendar_create_event", state: "active" });
+  h.tracker.request(toolRequest("create", "google_calendar_create_event"));
+  h.tracker.response(toolResponse("create", "google_calendar_create_event"));
+  h.tracker.upsert({ id: "calendar-delete:original", label: "Removing original Review", expectedToolName: "google_calendar_delete_event", state: "active" });
+  h.tracker.request(toolRequest("delete", "google_calendar_delete_event"));
+  h.tracker.response(toolResponse("delete", "google_calendar_delete_event", { is_error: true }));
+  assert.equal(h.actions[0].state, "complete");
+  assert.equal(h.actions[1].state, "failed");
+  assert.doesNotMatch(h.actions.map((action) => action.label).join(" "), /moved/i);
+  assert.equal(h.timers.size, 0);
 });
 
 test("ambiguous concurrent labels are not matched to the wrong calendar event", () => {

@@ -3,9 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConversation } from "@elevenlabs/react";
 import { parseCalendarEvents, parseGoogleCalendarResults } from "@/lib/calendar-events";
-import { createToolActivityTracker } from "@/lib/tool-activity";
+import { createToolActivityTracker, type ActionInput } from "@/lib/tool-activity";
 import type {
-  ActionState,
   AssistantAction,
   AssistantConfig,
   CalendarEvents,
@@ -103,7 +102,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     setConnecting(false);
   }, []);
 
-  const upsertAction = useCallback((input: { id?: string; label: string; detail?: string; state: ActionState }) => {
+  const upsertAction = useCallback((input: ActionInput) => {
     return activity.upsert(input);
   }, [activity]);
 
@@ -218,7 +217,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
         upsertAction({ id: "email-draft", label: "Email draft updated", state: "complete" });
         return "The visible email draft was updated. It has not been sent.";
       },
-      set_action_status: async (input: { id?: string; label: string; detail?: string; state: ActionState }) =>
+      set_action_status: async (input: ActionInput) =>
         upsertAction(input),
     },
   });

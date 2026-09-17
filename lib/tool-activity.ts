@@ -1,6 +1,6 @@
 import type { ActionState, AssistantAction } from "./types";
 
-type ActionInput = { id?: string; label: string; detail?: string; state: ActionState };
+export type ActionInput = { id?: string; label: string; detail?: string; state: ActionState; expectedToolName?: string };
 type ToolEvent = {
   tool_name: string;
   tool_call_id: string;
@@ -18,6 +18,9 @@ type Entry = {
   timer?: ReturnType<typeof setTimeout>;
   callId?: string;
   generic?: boolean;
+  expectedToolName?: string;
+  requestLabel?: string;
+  intendedKind?: Kind;
 };
 type Call = { entry: Entry; settled: boolean; toolName: string };
 
@@ -103,22 +106,31 @@ export function createToolActivityTracker(publish: (actions: AssistantAction[]) 
   return {
     upsert(input: ActionInput) {
       if (closed) return "The conversation has ended.";
+      if (input.expectedToolName !== undefined &&
+        (typeof input.expectedToolName !== "string" || !mutation(toolKind(input.expectedToolName)))) {
+        throw new Error("expectedToolName must name a supported Google Calendar mutation tool.");
+      }
       const id = input.id || input.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
       let entry = entries.get(id);
       // The real response owns bound activities. A later agent status cannot
       // reopen a completed spinner or claim an unconfirmed mutation succeeded.
       if (entry?.callId) return "This activity is controlled by the calendar tool result. Use a new ID for a new operation.";
-      const kind = actionKind(input) ?? entry?.kind;
+      const kind = actionKind(input) ?? (input.expectedToolName ? toolKind(input.expectedToolName) : entry?.kind);
       if (mutation(kind) && (input.state === "complete" || input.state === "failed")) {
         return "Calendar activity completion is controlled by the actual tool result.";
       }
       if (!entry && mutation(kind)) {
-        const candidates = [...entries.values()].filter((item) => item.generic && item.kind === kind && item.action.state === "active");
+        const active = [...entries.values()].filter((item) => mutation(item.kind) && item.action.state === "active");
+        const candidates = active.filter((item) => item.generic && (input.expectedToolName
+          ? calls.get(item.callId!)?.toolName === input.expectedToolName : active.length === 1));
         // Never guess between concurrent tool calls.
         if (candidates.length === 1) {
           entry = candidates[0];
           entries.delete(entry.action.id);
           entry.generic = false;
+          entry.requestLabel = input.label;
+          entry.intendedKind = kind;
+          entry.expectedToolName = input.expectedToolName;
           entry.action = { ...entry.action, id, label: input.label, detail: input.detail };
           entries.set(id, entry);
           emit();
@@ -126,12 +138,13 @@ export function createToolActivityTracker(publish: (actions: AssistantAction[]) 
         }
       }
       if (!entry) {
-        entry = { action: { ...input, id, updatedAt: Date.now() }, kind };
+        entry = { action: { ...input, id, updatedAt: Date.now() }, kind, expectedToolName: input.expectedToolName };
         entries.set(id, entry);
       } else {
         clearTimer(entry);
         entry.action = { ...input, id, updatedAt: Date.now() };
         entry.kind = kind;
+        entry.expectedToolName = input.expectedToolName ?? entry.expectedToolName;
       }
       if (input.state === "active" || input.state === "pending") arm(entry);
       emit();
@@ -140,15 +153,25 @@ export function createToolActivityTracker(publish: (actions: AssistantAction[]) 
     request(event: ToolEvent) {
       const kind = toolKind(event.tool_name);
       if (closed || !kind || retiredCalls.has(event.tool_call_id) || calls.has(event.tool_call_id)) return;
-      const candidates = mutation(kind) ? [...entries.values()].filter((entry) =>
-        !entry.callId && entry.kind === kind && (entry.action.state === "active" || entry.action.state === "pending")) : [];
+      const pending = mutation(kind) ? [...entries.values()].filter((entry) =>
+        !entry.callId && mutation(entry.kind) && (entry.action.state === "active" || entry.action.state === "pending")) : [];
+      const explicit = pending.filter((entry) => entry.expectedToolName === event.tool_name);
+      const otherMutationRunning = [...entries.values()].some((entry) => entry.callId && mutation(entry.kind) && entry.action.state === "active");
+      // Labels describe intent, not API method. Legacy matching is only safe
+      // when one unpinned mutation is pending and no other mutation is running.
+      const candidates = explicit.length ? explicit : pending.length === 1 && !pending[0].expectedToolName && !otherMutationRunning ? pending : [];
       let entry: Entry;
-      if (candidates.length === 1) entry = candidates[0];
+      if (candidates.length === 1) {
+        entry = candidates[0];
+        entry.requestLabel = entry.action.label;
+        entry.intendedKind = entry.kind;
+      }
       else {
         entry = { action: { id: `tool:${event.tool_call_id}`, label: presentations[kind].label, state: "active", updatedAt: Date.now() }, generic: true, kind };
         entries.set(entry.action.id, entry);
       }
       entry.callId = event.tool_call_id;
+      entry.kind = kind;
       entry.action.workingLabel = presentations[kind].working;
       setState(entry, "active", entry.action.detail);
       calls.set(event.tool_call_id, { entry, settled: false, toolName: event.tool_name });
@@ -175,10 +198,14 @@ export function createToolActivityTracker(publish: (actions: AssistantAction[]) 
       call.settled = true;
       const entry = call.entry;
       clearTimer(entry);
-      if (entry.generic) entry.action.label = failed ? presentations[entry.kind!].label : presentations[entry.kind!].complete;
+      entry.action.label = failed ? entry.requestLabel ?? presentations[entry.kind!].label : presentations[entry.kind!].complete;
+      const context = entry.requestLabel ? `Requested: ${entry.requestLabel}. ` : "";
+      const confirmation = entry.intendedKind === "update" && entry.kind !== "update"
+        ? `${presentations[entry.kind!].complete}. Moving the original event has not been confirmed.`
+        : "Confirmed by the calendar tool.";
       setState(entry, failed ? "failed" : "complete", failed
         ? mutation(entry.kind) ? "The calendar operation failed or was blocked. Verify the event before retrying." : "The check failed. Ask your assistant to try again."
-        : mutation(entry.kind) ? "Confirmed by the calendar tool." : undefined);
+        : mutation(entry.kind) ? context + confirmation : undefined);
       emit();
     },
     end() {
