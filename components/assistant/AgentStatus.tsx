@@ -2,7 +2,8 @@ import type { AssistantConfig } from "@/lib/types";
 
 type Props = {
   assistant: AssistantConfig;
-  status: "idle" | "connecting" | "listening" | "speaking" | "error";
+  status: "idle" | "connecting" | "listening" | "speaking" | "working" | "error";
+  workingLabel?: string;
   muted?: boolean;
 };
 
@@ -11,16 +12,17 @@ const labels = {
   connecting: "Joining you…",
   listening: "Listening",
   speaking: "Speaking",
+  working: "Working…",
   error: "Needs your attention",
 };
 
-export function AgentStatus({ assistant, status, muted = false }: Props) {
+export function AgentStatus({ assistant, status, muted = false, workingLabel }: Props) {
   return (
     <div className="agent-status">
       <span className={`status-dot ${status}`} />
       <span>{assistant.name}</span>
       <span className="status-divider">/</span>
-      <span className="status-copy">{muted && status !== "error" ? "Microphone muted" : labels[status]}</span>
+      <span className="status-copy" role="status">{muted && status !== "error" ? "Microphone muted" : status === "working" ? workingLabel || labels.working : labels[status]}</span>
     </div>
   );
 }

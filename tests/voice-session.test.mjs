@@ -26,6 +26,177 @@ test("captions hide delivery cues while preserving meaningful bracketed content"
   assert.equal(cleanAssistantCaption("[REASSURING] Your [Board Review] is on [insert date]."), "Your [Board Review] is on [insert date].");
   assert.equal(cleanAssistantCaption("Done [sighs]."), "Done.");
   assert.equal(cleanAssistantCaption("[reassuring]"), "");
+  assert.equal(cleanAssistantCaption("[checking] Checking [Board Review]."), "Checking [Board Review].");
+});
+
+function activityHarness() {
+  let actions = [];
+  let nextTimer = 0;
+  const timers = new Map();
+  const { createToolActivityTracker } = loadModule("../lib/tool-activity.ts", {}, {
+    setTimeout: (fn, ms) => { timers.set(++nextTimer, { fn, ms }); return nextTimer; },
+    clearTimeout: (id) => timers.delete(id),
+  });
+  const tracker = createToolActivityTracker((next) => { actions = next; });
+  return { tracker, timers, get actions() { return actions; }, expire() { for (const { fn } of [...timers.values()]) fn(); timers.clear(); } };
+}
+
+const toolRequest = (id, tool_name = "google_calendar_update_event", response_timeout_secs = 20) => ({ tool_call_id: id, tool_name, response_timeout_secs });
+const toolResponse = (id, tool_name = "google_calendar_update_event", extra = {}) => ({ ...toolRequest(id, tool_name), is_error: false, is_called: true, status: "success", ...extra });
+
+test("moving label binds to mutation, ignores agent completion, and finishes on real result", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ id: "calendar-update:one", label: "Moving Review to 11:30", state: "active" });
+  h.tracker.upsert({ id: "calendar-update:one", label: "Moved Review", state: "complete" });
+  assert.equal(h.actions[0].state, "active");
+  h.tracker.request(toolRequest("one", undefined, 12));
+  assert.equal(h.actions.length, 1);
+  assert.equal(h.actions[0].workingLabel, "Updating calendar…");
+  assert.equal([...h.timers.values()][0].ms, 17000);
+  h.tracker.request(toolRequest("one"));
+  assert.equal(h.timers.size, 1, "duplicate request does not restart timeout");
+  h.tracker.upsert({ id: "calendar-update:one", label: "Moved Review", state: "complete" });
+  assert.equal(h.actions[0].state, "active");
+  h.tracker.response(toolResponse("one"));
+  assert.equal(h.actions[0].state, "complete");
+  assert.equal(h.actions[0].label, "Moving Review to 11:30");
+  assert.match(h.actions[0].detail, /Confirmed/);
+  h.tracker.response(toolResponse("one", undefined, { full_tool_result: '{"id":"event"}' }));
+  h.tracker.upsert({ id: "calendar-update:one", label: "Moving Review", state: "active" });
+  assert.equal(h.actions[0].state, "complete");
+  assert.equal(h.timers.size, 0);
+});
+
+test("availability does not claim a moving row; mutation can receive its label after starting", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ label: "Moving Review to noon", state: "active" });
+  h.tracker.request(toolRequest("check", "google_calendar_check_availability"));
+  h.tracker.response(toolResponse("check", "google_calendar_check_availability"));
+  assert.equal(h.actions[0].state, "active");
+  h.tracker.request(toolRequest("move"));
+  h.tracker.response(toolResponse("move"));
+  assert.equal(h.actions[0].state, "complete");
+
+  const late = activityHarness();
+  late.tracker.request(toolRequest("move"));
+  late.tracker.upsert({ id: "calendar-update:late", label: "Moving Review to noon", state: "active" });
+  assert.equal(late.actions.length, 1);
+  late.tracker.response(toolResponse("move"));
+  assert.equal(late.actions[0].id, "calendar-update:late");
+  assert.equal(late.actions[0].state, "complete");
+});
+
+test("ambiguous concurrent labels are not matched to the wrong calendar event", () => {
+  const h = activityHarness();
+  for (const name of ["one", "two"]) h.tracker.upsert({ id: `calendar-update:${name}`, label: `Moving ${name}`, state: "active" });
+  h.tracker.request(toolRequest("call"));
+  h.tracker.response(toolResponse("call"));
+  assert.equal(h.actions.length, 3);
+  assert.equal(h.actions[0].state, "active");
+  assert.equal(h.actions[1].state, "active");
+  assert.equal(h.actions[2].state, "complete");
+  h.expire();
+  assert.equal(h.actions.filter((action) => action.state === "active").length, 0);
+});
+
+test("timeouts clear spinners without claiming a failed write; a current late result can recover", () => {
+  const h = activityHarness();
+  h.tracker.request(toolRequest("one"));
+  h.expire();
+  assert.equal(h.actions[0].state, "failed");
+  assert.match(h.actions[0].detail, /not confirmed.*Check the calendar/);
+  h.tracker.response(toolResponse("one"));
+  assert.equal(h.actions[0].state, "complete");
+
+  h.tracker.request(toolRequest("old"));
+  h.expire();
+  h.tracker.request(toolRequest("new"));
+  h.tracker.response(toolResponse("old"));
+  assert.equal(h.actions[1].state, "failed", "superseded late result retains uncertainty");
+  assert.equal(h.actions[2].state, "active");
+  h.tracker.response(toolResponse("new"));
+  assert.equal(h.actions[2].state, "complete");
+});
+
+test("orphan agent activities time out even if no tool ever starts", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ label: "Moving Review", state: "active" });
+  h.tracker.upsert({ label: "Preparing a note", state: "pending" });
+  h.expire();
+  assert.ok(h.actions.every((action) => action.state === "failed"));
+  assert.equal(h.timers.size, 0);
+});
+
+test("completed local preference and draft activities do not require a calendar tool", () => {
+  const h = activityHarness();
+  h.tracker.upsert({ id: "preferences", label: "Scheduling preferences saved", state: "complete" });
+  h.tracker.upsert({ id: "email-draft", label: "Drafting a note to Jordan", state: "complete" });
+  assert.equal(h.actions.length, 2);
+  assert.ok(h.actions.every((action) => action.state === "complete"));
+  assert.equal(h.timers.size, 0);
+});
+
+test("failure, blocking, skipped execution, and embedded API errors cannot show success", () => {
+  for (const extra of [{ is_error: true }, { is_blocked: true }, { is_called: false }, { status: "failure" }, { full_tool_result: '{"error":{"message":"private detail"}}' }]) {
+    const h = activityHarness();
+    h.tracker.request(toolRequest("one"));
+    h.tracker.response(toolResponse("one", undefined, extra));
+    assert.equal(h.actions[0].state, "failed");
+    assert.doesNotMatch(h.actions[0].detail, /private detail/);
+    h.tracker.response(toolResponse("one"));
+    assert.equal(h.actions[0].state, "failed");
+    assert.equal(h.timers.size, 0);
+  }
+  const h = activityHarness();
+  h.tracker.response(toolResponse("check", "google_calendar_check_availability"));
+  h.tracker.response(toolResponse("check", "google_calendar_check_availability", { full_tool_result: '{"calendars":{"primary":{"errors":[{"reason":"notFound"}]}}}' }));
+  assert.equal(h.actions[0].state, "failed", "payload can refine metadata success");
+});
+
+test("end, dispose, and new-session reset clean up timers and reject retired tool calls", () => {
+  const h = activityHarness();
+  h.tracker.request(toolRequest("old"));
+  h.tracker.end();
+  assert.equal(h.actions[0].state, "failed");
+  assert.equal(h.timers.size, 0);
+  h.tracker.response(toolResponse("old"));
+  assert.equal(h.actions[0].state, "failed");
+  h.tracker.reset();
+  h.tracker.response(toolResponse("old"));
+  assert.equal(h.actions.length, 0);
+  h.tracker.request(toolRequest("new"));
+  h.tracker.dispose();
+  assert.equal(h.timers.size, 0);
+});
+
+test("availability working state is bounded and does not replace event cards or interrupt audio", () => {
+  const h = hookHarness();
+  h.callbacks.onConnect();
+  h.callbacks.onAgentToolResponse(calendarResponse("agenda"));
+  const agenda = h.render().agenda;
+  h.callbacks.onAgentToolRequest(toolRequest("check", "google_calendar_check_availability"));
+  assert.equal(h.render().status, "working");
+  assert.equal(h.render().workingLabel, "Checking calendar…");
+  assert.equal(h.render().agenda, agenda);
+  h.conversation.isSpeaking = true;
+  assert.equal(h.render().status, "speaking");
+  h.conversation.isSpeaking = false;
+  h.expire();
+  assert.equal(h.render().status, "listening");
+  assert.equal(h.render().connected, true);
+  assert.equal(h.render().error, undefined);
+  h.callbacks.onAgentToolResponse(toolResponse("check", "google_calendar_check_availability"));
+  assert.equal(h.render().actions.at(-1).state, "complete");
+  assert.equal(h.render().agenda, agenda);
+});
+
+test("working label is visible, while microphone mute keeps its status precedence", () => {
+  const { AgentStatus } = loadModule("../components/assistant/AgentStatus.tsx", { "react/jsx-runtime": jsxRuntime });
+  const props = { assistant: { name: "Cove" }, status: "working", workingLabel: "Updating calendar…" };
+  assert.match(renderToStaticMarkup(createElement(AgentStatus, props)), /Updating calendar/);
+  const muted = renderToStaticMarkup(createElement(AgentStatus, { ...props, muted: true }));
+  assert.match(muted, /Microphone muted/);
+  assert.doesNotMatch(muted, /Updating calendar/);
 });
 
 test("agent IDs tolerate literal dashboard quotes and surrounding whitespace", () => {
@@ -48,6 +219,8 @@ function hookHarness(response, options = {}) {
   const microphoneMutes = [];
   const refs = [];
   const timers = new Map();
+  const schedule = (callback) => { timers.set(++timerId, callback); return timerId; };
+  const unschedule = (id) => timers.delete(id);
   let refCursor = 0;
   let timerId = 0;
   let ends = 0;
@@ -73,7 +246,7 @@ function hookHarness(response, options = {}) {
       },
       useState: (initial) => {
         const index = cursor++;
-        if (!(index in values)) values[index] = initial;
+        if (!(index in values)) values[index] = typeof initial === "function" ? initial() : initial;
         return [values[index], (value) => {
           values[index] = typeof value === "function" ? value(values[index]) : value;
           states.push(values[index]);
@@ -81,11 +254,12 @@ function hookHarness(response, options = {}) {
       },
     },
     "@/lib/calendar-events": loadModule("../lib/calendar-events.ts", {}),
+    "@/lib/tool-activity": loadModule("../lib/tool-activity.ts", {}, { setTimeout: schedule, clearTimeout: unschedule }),
     "@elevenlabs/react": { useConversation: (options) => { callbacks = options; return conversation; } },
   }, {
     AbortController,
-    setTimeout: (callback) => { timers.set(++timerId, callback); return timerId; },
-    clearTimeout: (id) => timers.delete(id),
+    setTimeout: schedule,
+    clearTimeout: unschedule,
     fetch: options.fetch ?? (async () => response),
     navigator: { mediaDevices: { getUserMedia: options.getUserMedia ?? (async () => ({
       getTracks: () => [{ stop: () => { stopped = true; } }],

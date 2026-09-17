@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConversation } from "@elevenlabs/react";
 import { parseCalendarEvents, parseGoogleCalendarResults } from "@/lib/calendar-events";
+import { createToolActivityTracker } from "@/lib/tool-activity";
 import type {
   ActionState,
   AssistantAction,
@@ -34,7 +35,7 @@ type Params = {
 // [Board Review] and [insert date] intact; never rewrite the spoken audio.
 export function cleanAssistantCaption(text: string): string {
   return text
-    .replace(/\[(?:reassuring|warm|warmly|calm|calmly|confident|confidently|cheerful|excited|enthusiastic|empathetic|thoughtful|serious|professional|friendly|curious|sad|angry|sarcastic|sighs?|laughs?|laughing|chuckles?|whispers?|whispering|shouts?|shouting|pause|short pause|long pause)\]/gi, "")
+    .replace(/\[(?:checking|reassuring|warm|warmly|calm|calmly|confident|confidently|cheerful|excited|enthusiastic|empathetic|thoughtful|serious|professional|friendly|curious|sad|angry|sarcastic|sighs?|laughs?|laughing|chuckles?|whispers?|whispering|shouts?|shouting|pause|short pause|long pause)\]/gi, "")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/ +([,.!?;:])/g, "$1")
     .trim();
@@ -51,6 +52,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const [error, setError] = useState<string>();
   const [draft, setDraft] = useState<EmailDraft>();
   const [actions, setActions] = useState<AssistantAction[]>([]);
+  const [activity] = useState(() => createToolActivityTracker(setActions));
   const [lastMessage, setLastMessage] = useState("I’m ready when you are.");
   const [connecting, setConnecting] = useState(false);
   const [agenda, setAgenda] = useState<CalendarEvents | GoogleCalendarResults>();
@@ -102,15 +104,8 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   }, []);
 
   const upsertAction = useCallback((input: { id?: string; label: string; detail?: string; state: ActionState }) => {
-    const id = input.id || input.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-    setActions((current) => {
-      const next: AssistantAction = { ...input, id, updatedAt: Date.now() };
-      const existing = current.findIndex((item) => item.id === id);
-      if (existing < 0) return [...current, next];
-      return current.map((item, index) => (index === existing ? next : item));
-    });
-    return "The action display was updated.";
-  }, []);
+    return activity.upsert(input);
+  }, [activity]);
 
   const conversation = useConversation({
     // Controlled input mute is applied by the SDK when a session is created,
@@ -130,6 +125,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     },
     onDisconnect: (details) => {
       clearPending();
+      activity.end();
       if (calendarCall.current && !calendarCall.current.complete) {
         finishCalendar("failed", "The conversation ended before calendar results arrived.");
       }
@@ -152,10 +148,14 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       if (event.source === "ai" && event.message) setLastMessage(cleanAssistantCaption(event.message));
     },
     onAgentToolRequest: (event) => {
-      if (!cancelled.current && event.tool_name === "google_calendar_list_events") beginCalendar(event.tool_call_id);
+      if (cancelled.current) return;
+      activity.request(event);
+      if (event.tool_name === "google_calendar_list_events") beginCalendar(event.tool_call_id);
     },
     onAgentToolResponse: (event) => {
-      if (cancelled.current || event.tool_name !== "google_calendar_list_events") return;
+      if (cancelled.current) return;
+      activity.response(event);
+      if (event.tool_name !== "google_calendar_list_events") return;
       if (!beginCalendar(event.tool_call_id)) return; // A newer request superseded this call.
       if (calendarCall.current?.complete) return; // Metadata/full-payload duplicates.
       if (event.is_error || ("is_blocked" in event && event.is_blocked)) {
@@ -237,6 +237,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     setError(undefined);
     setConnecting(true);
     cancelled.current = false;
+    activity.reset();
     clearCalendarTimer();
     calendarCall.current = null;
     calendarSeen.current.clear();
@@ -287,10 +288,11 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       clearPending();
       setError(voiceErrorMessage(error));
     }
-  }, [assistant.agentId, assistant.name, clearPending, clearCalendarTimer, connected, conversation, reconnectNeedsReload]);
+  }, [assistant.agentId, assistant.name, activity, clearPending, clearCalendarTimer, connected, conversation, reconnectNeedsReload]);
 
   const stop = useCallback(async () => {
     cancelled.current = true;
+    activity.end();
     setReconnectNeedsReload(pending.current?.sdkStarted ?? false);
     clearPending();
     if (calendarCall.current && !calendarCall.current.complete) {
@@ -298,11 +300,12 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     }
     setTransportConnected(false);
     await conversation.endSession();
-  }, [clearPending, conversation, finishCalendar]);
+  }, [activity, clearPending, conversation, finishCalendar]);
 
   const endSession = conversation.endSession;
   useEffect(() => () => {
     cancelled.current = true;
+    activity.dispose();
     clearCalendarTimer();
     if (pending.current) {
       clearTimeout(pending.current.timer);
@@ -310,7 +313,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       pending.current = null;
     }
     endSession();
-  }, [endSession, clearCalendarTimer]);
+  }, [activity, endSession, clearCalendarTimer]);
 
   const toggleMicrophoneMuted = useCallback(() => {
     const next = !microphoneMuted;
@@ -322,12 +325,14 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     setMicrophoneMuted(next);
   }, [connected, conversation, microphoneMuted]);
 
+  const workingLabel = actions.findLast((action) => action.state === "active" && action.workingLabel)?.workingLabel;
   const status = useMemo(() => {
     if (error) return "error" as const;
     if (connecting) return "connecting" as const;
     if (!connected) return "idle" as const;
-    return conversation.isSpeaking ? "speaking" as const : "listening" as const;
-  }, [connected, connecting, conversation.isSpeaking, error]);
+    if (conversation.isSpeaking) return "speaking" as const;
+    return workingLabel ? "working" as const : "listening" as const;
+  }, [connected, connecting, conversation.isSpeaking, error, workingLabel]);
 
   return {
     status,
@@ -338,6 +343,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     draft,
     setDraft,
     actions,
+    workingLabel,
     lastMessage,
     agenda,
     calendarStatus,

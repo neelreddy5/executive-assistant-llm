@@ -37,7 +37,7 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
           <h1>Let’s shape how {assistant.name}<br />manages your time.</h1>
           <p className="lede">Your assistant will learn your meeting rhythm, focus time, and boundaries naturally.</p>
           <VoiceOrb state={session.status} accent={assistant.accent} onClick={!session.connected && session.status !== "connecting" ? session.start : undefined} />
-          <AgentStatus assistant={assistant} status={session.status} muted={session.microphoneMuted} />
+          <AgentStatus assistant={assistant} status={session.status} muted={session.microphoneMuted} workingLabel={session.workingLabel} />
           {!session.connected && session.status !== "connecting" && (
             <button className="primary-button voice-start" onClick={session.start}><Mic size={17} /> {session.reconnectNeedsReload ? "Reload voice session" : "Start voice setup"}</button>
           )}
@@ -54,7 +54,7 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
             </div>
             <div className="voice-center">
               <VoiceOrb state={session.status} accent={assistant.accent} onClick={!session.connected && session.status !== "connecting" ? session.start : undefined} />
-              <AgentStatus assistant={assistant} status={session.status} muted={session.microphoneMuted} />
+              <AgentStatus assistant={assistant} status={session.status} muted={session.microphoneMuted} workingLabel={session.workingLabel} />
               <p className="spoken-caption">“{session.lastMessage}”</p>
               {!session.connected && session.status !== "connecting" ? (
                 <button className="primary-button voice-start" onClick={session.start}><Mic size={17} /> {session.reconnectNeedsReload ? "Reload voice session" : `Speak with ${assistant.name}`}</button>

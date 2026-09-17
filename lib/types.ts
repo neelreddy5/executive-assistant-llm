@@ -75,4 +75,5 @@ export type AssistantAction = {
   detail?: string;
   state: ActionState;
   updatedAt: number;
+  workingLabel?: string;
 };

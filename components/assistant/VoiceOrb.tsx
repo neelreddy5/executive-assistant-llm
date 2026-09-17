@@ -1,7 +1,7 @@
 "use client";
 
 type Props = {
-  state: "idle" | "connecting" | "listening" | "speaking" | "error";
+  state: "idle" | "connecting" | "listening" | "speaking" | "working" | "error";
   accent: string;
   onClick?: () => void;
 };
