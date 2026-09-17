@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConversation } from "@elevenlabs/react";
-import { parseCalendarEvents } from "@/lib/calendar-events";
+import { parseCalendarEvents, parseGoogleCalendarResults } from "@/lib/calendar-events";
 import type {
   ActionState,
   AssistantAction,
   AssistantConfig,
   CalendarEvents,
+  CalendarDisplayStatus,
+  GoogleCalendarResults,
   EmailDraft,
   ExecutiveContext,
   Preferences,
@@ -51,7 +53,8 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const [actions, setActions] = useState<AssistantAction[]>([]);
   const [lastMessage, setLastMessage] = useState("I’m ready when you are.");
   const [connecting, setConnecting] = useState(false);
-  const [agenda, setAgenda] = useState<CalendarEvents>();
+  const [agenda, setAgenda] = useState<CalendarEvents | GoogleCalendarResults>();
+  const [calendarStatus, setCalendarStatus] = useState<CalendarDisplayStatus>();
   const [microphoneMuted, setMicrophoneMuted] = useState(false);
   const [reconnectNeedsReload, setReconnectNeedsReload] = useState(false);
   // SDK status can become "error" after a nonfatal client-tool error while
@@ -59,6 +62,35 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
   const [transportConnected, setTransportConnected] = useState(false);
   const pending = useRef<{ controller: AbortController; timer: ReturnType<typeof setTimeout>; sdkStarted: boolean } | null>(null);
   const cancelled = useRef(false);
+  const calendarCall = useRef<{ id: string; complete: boolean } | null>(null);
+  const calendarSeen = useRef(new Set<string>());
+  const calendarTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  const clearCalendarTimer = useCallback(() => {
+    if (calendarTimer.current !== undefined) clearTimeout(calendarTimer.current);
+    calendarTimer.current = undefined;
+  }, []);
+
+  const finishCalendar = useCallback((state: "complete" | "failed", message: string) => {
+    clearCalendarTimer();
+    if (calendarCall.current) calendarCall.current.complete = true;
+    setCalendarStatus({ state, message });
+  }, [clearCalendarTimer]);
+
+  const beginCalendar = useCallback((id: string) => {
+    if (calendarSeen.current.has(id)) return calendarCall.current?.id === id;
+    calendarSeen.current.add(id);
+    clearCalendarTimer();
+    calendarCall.current = { id, complete: false };
+    setAgenda(undefined);
+    setCalendarStatus({ state: "loading", message: "Finding calendar events…" });
+    // The integration has a 20-second timeout. Leave room for event delivery,
+    // but never leave the sidebar loading indefinitely if payloads are disabled.
+    calendarTimer.current = setTimeout(() => {
+      finishCalendar("failed", "Calendar results did not arrive. Please try your request again.");
+    }, 25_000);
+    return true;
+  }, [clearCalendarTimer, finishCalendar]);
 
   const clearPending = useCallback(() => {
     if (pending.current) {
@@ -98,6 +130,9 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     },
     onDisconnect: (details) => {
       clearPending();
+      if (calendarCall.current && !calendarCall.current.complete) {
+        finishCalendar("failed", "The conversation ended before calendar results arrived.");
+      }
       setTransportConnected(false);
       if (details.reason === "error") setError(voiceErrorMessage(details.message));
       else if (details.reason === "agent") setError("The assistant ended the conversation. You can reconnect when ready.");
@@ -116,11 +151,44 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       const event = message as unknown as { message?: string; source?: string };
       if (event.source === "ai" && event.message) setLastMessage(cleanAssistantCaption(event.message));
     },
+    onAgentToolRequest: (event) => {
+      if (!cancelled.current && event.tool_name === "google_calendar_list_events") beginCalendar(event.tool_call_id);
+    },
+    onAgentToolResponse: (event) => {
+      if (cancelled.current || event.tool_name !== "google_calendar_list_events") return;
+      if (!beginCalendar(event.tool_call_id)) return; // A newer request superseded this call.
+      if (calendarCall.current?.complete) return; // Metadata/full-payload duplicates.
+      if (event.is_error || ("is_blocked" in event && event.is_blocked)) {
+        finishCalendar("failed", "Could not retrieve calendar events. Please ask your assistant to try again.");
+        return;
+      }
+      if (!("full_tool_result" in event)) {
+        // Metadata can precede the full result. It is not an empty calendar.
+        clearCalendarTimer();
+        calendarTimer.current = setTimeout(() => {
+          finishCalendar("failed", "The calendar lookup finished, but its results were not received for display.");
+        }, 5_000);
+        return;
+      }
+      if (event.truncated) {
+        finishCalendar("failed", "Calendar results were too large to display. Try asking for fewer events.");
+        return;
+      }
+      try {
+        const result = parseGoogleCalendarResults(event.full_tool_result, context.profile.timezone);
+        setAgenda(result);
+        finishCalendar("complete", `${result.events.length} calendar events received.`);
+      } catch {
+        // Do not expose calendar contents or raw SDK payloads in error messages.
+        finishCalendar("failed", "Calendar results could not be displayed. Please try your request again.");
+      }
+    },
     clientTools: {
       show_calendar_events: async (input: unknown) => {
         try {
           const result = parseCalendarEvents(input);
           setAgenda(result);
+          setCalendarStatus({ state: "complete", message: "Calendar agenda updated." });
           upsertAction({ id: "calendar-display", label: "Calendar agenda updated", state: "complete" });
           return "The calendar agenda is now displayed. You can summarize the retrieved events.";
         } catch (error) {
@@ -169,6 +237,11 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     setError(undefined);
     setConnecting(true);
     cancelled.current = false;
+    clearCalendarTimer();
+    calendarCall.current = null;
+    calendarSeen.current.clear();
+    setAgenda(undefined);
+    setCalendarStatus(undefined);
     const controller = new AbortController();
     const attempt = {
       controller,
@@ -214,26 +287,30 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
       clearPending();
       setError(voiceErrorMessage(error));
     }
-  }, [assistant.agentId, assistant.name, clearPending, connected, conversation, reconnectNeedsReload]);
+  }, [assistant.agentId, assistant.name, clearPending, clearCalendarTimer, connected, conversation, reconnectNeedsReload]);
 
   const stop = useCallback(async () => {
     cancelled.current = true;
     setReconnectNeedsReload(pending.current?.sdkStarted ?? false);
     clearPending();
+    if (calendarCall.current && !calendarCall.current.complete) {
+      finishCalendar("failed", "The conversation ended before calendar results arrived.");
+    }
     setTransportConnected(false);
     await conversation.endSession();
-  }, [clearPending, conversation]);
+  }, [clearPending, conversation, finishCalendar]);
 
   const endSession = conversation.endSession;
   useEffect(() => () => {
     cancelled.current = true;
+    clearCalendarTimer();
     if (pending.current) {
       clearTimeout(pending.current.timer);
       pending.current.controller.abort();
       pending.current = null;
     }
     endSession();
-  }, [endSession]);
+  }, [endSession, clearCalendarTimer]);
 
   const toggleMicrophoneMuted = useCallback(() => {
     const next = !microphoneMuted;
@@ -263,6 +340,7 @@ export function useExecutiveAssistant({ assistant, context, onSavePreferences }:
     actions,
     lastMessage,
     agenda,
+    calendarStatus,
     microphoneMuted,
     toggleMicrophoneMuted,
     reconnectNeedsReload,

@@ -75,7 +75,7 @@ export function ExecutiveAssistant({ assistant, context, onSavePreferences, onRe
             </div>
           </section>
           <section className="context-rail">
-            {session.agenda && <CalendarEventsCard agenda={session.agenda} />}
+            {(session.agenda || session.calendarStatus) && <CalendarEventsCard agenda={session.agenda} status={session.calendarStatus} />}
             <ActionStatus actions={session.actions} />
             {session.draft && (
               <EmailDraftCard draft={session.draft} onChange={session.setDraft} onClose={() => session.setDraft(undefined)} />

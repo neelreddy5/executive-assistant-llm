@@ -96,7 +96,7 @@ function hookHarness(response, options = {}) {
     refCursor = 0;
     // React primitives are mocked above to exercise session orchestration directly.
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    return useExecutiveAssistant({ assistant: { agentId: "agent_test", name: "Cove" }, context: {} });
+    return useExecutiveAssistant({ assistant: { agentId: "agent_test", name: "Cove" }, context: { profile: { timezone: "America/New_York" } } });
   }
   const hook = render();
   return { hook, render, conversation, microphoneMutes, volumes, sessions, states, timers, expire: () => { for (const callback of [...timers.values()]) callback(); }, get ends() { return ends; }, get callbacks() { return callbacks; }, get stopped() { return stopped; } };
@@ -114,6 +114,128 @@ test("calendar tool updates the agenda, preserves it on invalid results, and acc
   assert.equal(harness.render().agenda, previous);
   await harness.callbacks.clientTools.show_calendar_events({ ...input, events: [] });
   assert.equal(harness.render().agenda.events.length, 0);
+});
+
+const googleEvent = { id: "meeting", summary: "Product review", start: { dateTime: "2026-09-17T14:00:00Z" }, end: { dateTime: "2026-09-17T14:30:00Z" } };
+const calendarRequest = (id) => ({ tool_name: "google_calendar_list_events", tool_call_id: id, tool_type: "webhook", event_id: 1 });
+const calendarResponse = (id, result = { items: [googleEvent] }, extra = {}) => ({
+  ...calendarRequest(id), is_error: false, full_tool_result: JSON.stringify(result), ...extra,
+});
+
+test("built-in calendar results render without a client tool or another fetch", () => {
+  const harness = hookHarness(undefined, { fetch: () => { throw new Error("Unexpected fetch"); } });
+  harness.callbacks.onAgentToolRequest(calendarRequest("one"));
+  assert.equal(harness.render().calendarStatus.state, "loading");
+  harness.callbacks.onAgentToolResponse({ ...calendarRequest("one"), is_error: false });
+  assert.equal(harness.render().agenda, undefined, "metadata is not an empty result");
+  harness.callbacks.onAgentToolResponse(calendarResponse("one", { items: [googleEvent], nextPageToken: "next" }));
+  const result = harness.render();
+  assert.equal(result.agenda.events[0].title, "Product review");
+  assert.equal(result.agenda.timezone, "America/New_York");
+  assert.equal(result.agenda.hasMore, true);
+  assert.equal(result.calendarStatus.state, "complete");
+  assert.equal(harness.timers.size, 0);
+  harness.callbacks.onAgentToolResponse({ ...calendarRequest("one"), is_error: false });
+  harness.callbacks.onAgentToolResponse(calendarResponse("one", { items: [] }));
+  assert.equal(harness.render().agenda, result.agenda, "duplicate callbacks do not replace results");
+});
+
+test("calendar responses ignore other tools and superseded calls", () => {
+  const harness = hookHarness();
+  harness.callbacks.onAgentToolResponse({ ...calendarResponse("unrelated"), tool_name: "another_tool" });
+  assert.equal(harness.render().calendarStatus, undefined);
+  harness.callbacks.onAgentToolRequest(calendarRequest("old"));
+  harness.callbacks.onAgentToolRequest(calendarRequest("new"));
+  harness.callbacks.onAgentToolResponse(calendarResponse("old"));
+  assert.equal(harness.render().agenda, undefined);
+  harness.callbacks.onAgentToolResponse(calendarResponse("new", { items: [] }));
+  assert.equal(harness.render().agenda.events.length, 0);
+  harness.callbacks.onAgentToolRequest(calendarRequest("old"));
+  harness.callbacks.onAgentToolResponse(calendarResponse("old"));
+  assert.equal(harness.render().agenda.events.length, 0);
+});
+
+test("calendar failures, truncation, and unsupported payloads do not break audio", () => {
+  for (const extra of [
+    { is_error: true }, { is_blocked: true }, { truncated: true },
+    { full_tool_result: "not json" }, { full_tool_result: JSON.stringify({ unexpected: [] }) },
+    { full_tool_result: JSON.stringify({ error: { message: "secret" }, items: [] }) },
+  ]) {
+    const harness = hookHarness();
+    harness.callbacks.onConnect();
+    harness.callbacks.onAgentToolResponse(calendarResponse("one", undefined, extra));
+    const result = harness.render();
+    assert.equal(result.calendarStatus.state, "failed");
+    assert.equal(result.agenda, undefined);
+    assert.equal(result.error, undefined);
+    assert.equal(result.connected, true);
+    assert.doesNotMatch(result.calendarStatus.message, /secret|not json/);
+    assert.equal(harness.timers.size, 0);
+  }
+});
+
+test("missing calendar payloads time out and a new request can recover", () => {
+  const harness = hookHarness();
+  harness.callbacks.onAgentToolRequest(calendarRequest("one"));
+  harness.callbacks.onAgentToolResponse({ ...calendarRequest("one"), is_error: false });
+  harness.expire();
+  assert.match(harness.render().calendarStatus.message, /not received/);
+  harness.callbacks.onAgentToolResponse(calendarResponse("two"));
+  assert.equal(harness.render().calendarStatus.state, "complete");
+  harness.callbacks.onAgentToolRequest(calendarRequest("three"));
+  assert.equal(harness.render().agenda, undefined, "previous cards do not masquerade as new results");
+  harness.expire();
+  assert.equal(harness.render().calendarStatus.state, "failed");
+});
+
+test("ending a session cancels calendar loading and ignores late results", async () => {
+  const harness = hookHarness();
+  harness.callbacks.onAgentToolRequest(calendarRequest("one"));
+  await harness.render().stop();
+  assert.equal(harness.timers.size, 0);
+  assert.equal(harness.render().calendarStatus.state, "failed");
+  harness.callbacks.onAgentToolResponse(calendarResponse("one"));
+  assert.equal(harness.render().agenda, undefined);
+});
+
+test("Google calendar normalization handles recurrence, cancellation, timezones, and all-day spans", () => {
+  const { parseGoogleCalendarResults, groupCalendarEvents, calendarEventTime } = loadModule("../lib/calendar-events.ts", {});
+  const result = parseGoogleCalendarResults(JSON.stringify({ timeZone: "America/Los_Angeles", items: [
+    googleEvent, googleEvent,
+    { ...googleEvent, id: "recurrence_2", summary: "" },
+    { id: "cancelled", status: "cancelled" },
+    { id: "trip", summary: "Trip", start: { date: "2026-09-18" }, end: { date: "2026-09-21" } },
+  ] }), "UTC");
+  assert.equal(result.events.length, 3);
+  assert.equal(result.events[1].title, "Untitled event");
+  assert.match(calendarEventTime(result.events[0], result.timezone), /7:00 AM/);
+  assert.match(calendarEventTime(result.events[2], result.timezone), /Sep 18.*Sep 20/);
+  assert.equal(groupCalendarEvents(result).flatMap((day) => day.events).length, 3, "one card per event");
+  for (const item of [
+    { ...googleEvent, start: { dateTime: "2026-09-17T14:00:00" } },
+    { ...googleEvent, end: googleEvent.start },
+    { ...googleEvent, start: { date: "2026-02-30" } },
+    { ...googleEvent, start: { date: "2026-09-17" } },
+  ]) assert.throws(() => parseGoogleCalendarResults(JSON.stringify({ items: [item] }), "UTC"));
+  assert.throws(() => parseGoogleCalendarResults('{"items":[],"timeZone":"invalid"}', "UTC"));
+});
+
+test("calendar cards show empty, partial, loading, and safe text states", () => {
+  const calendar = loadModule("../lib/calendar-events.ts", {});
+  const { CalendarEventsCard } = loadModule("../components/assistant/CalendarEventsCard.tsx", {
+    "react/jsx-runtime": jsxRuntime, "lucide-react": icons, "@/lib/calendar-events": calendar,
+  });
+  const agenda = calendar.parseGoogleCalendarResults(JSON.stringify({ items: [{ ...googleEvent, summary: '<script>alert("x")</script>' }], nextPageToken: "next" }), "UTC");
+  const html = renderToStaticMarkup(createElement(CalendarEventsCard, { agenda }));
+  assert.match(html, /Calendar results/);
+  assert.match(html, /More results are available/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(renderToStaticMarkup(createElement(CalendarEventsCard, { agenda: { ...agenda, events: [], hasMore: false } })), /No events returned/);
+  const loading = renderToStaticMarkup(createElement(CalendarEventsCard, { status: { state: "loading", message: "Finding calendar events…" } }));
+  assert.match(loading, /aria-busy="true"/);
+  assert.match(loading, /role="status"/);
+  assert.doesNotMatch(loading, /No events returned/);
 });
 
 test("microphone mute blocks input without muting assistant playback and persists across reconnects", () => {

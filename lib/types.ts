@@ -57,6 +57,18 @@ export type CalendarEvents = {
   events: CalendarEvent[];
 };
 
+export type GoogleCalendarResults = {
+  source: "google";
+  timezone: string;
+  events: CalendarEvent[];
+  hasMore: boolean;
+};
+
+export type CalendarDisplayStatus = {
+  state: "loading" | "complete" | "failed";
+  message: string;
+};
+
 export type AssistantAction = {
   id: string;
   label: string;
